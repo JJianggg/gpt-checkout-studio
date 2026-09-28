@@ -1,0 +1,16 @@
+:root {
+  font-family: Inter, 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  color: #17211d;
+  background: #f5f7f3;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+html { min-width: 320px; background: #f5f7f3; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input, select { font: inherit; }
+button { cursor: pointer; }
+a { color: inherit; }
+::selection { color: #0d3327; background: #b9ebd4; }
