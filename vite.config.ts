@@ -23,7 +23,7 @@ const countryCurrencies = new Map([
   ['TR', 'TRY'],
   ['VN', 'VND'],
 ])
-const planNames = new Set(['chatgptplusplan', 'chatgptprolite', 'chatgptpro'])
+const planNames = new Set(['chatgptplusplan', 'chatgptprolite', 'chatgptpro', 'chatgptpromax'])
 
 type CheckoutBody = {
   accessToken?: string
@@ -73,7 +73,11 @@ async function readBody(request: IncomingMessage): Promise<CheckoutBody> {
     chunks.push(buffer)
   }
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as CheckoutBody
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('请求 JSON 必须是对象')
+    }
+    return parsed as CheckoutBody
   } catch {
     throw new Error('请求 JSON 格式无效')
   }
@@ -101,12 +105,19 @@ async function exists(path: string) {
   }
 }
 
-function safeMessage(error: unknown, secrets: string[]) {
+function safeMessage(error: unknown, secrets: unknown[]) {
   let message = error instanceof Error ? error.message : '创建支付链接失败'
   for (const secret of secrets) {
-    if (secret) message = message.split(secret).join('[redacted]')
+    if (typeof secret === 'string' && secret) message = message.split(secret).join('[redacted]')
+  }
+  if (message.includes('checkout rejected for unusual activity')) {
+    return 'OpenAI 支付接口返回 400：Our systems have detected unusual activity. Please try again later. 官网浏览器请求与本地独立请求的校验上下文不同；上游未说明具体触发原因。若官网可用，请直接使用官网结账。'
   }
   return message
+}
+
+function bodyString(value: unknown) {
+  return typeof value === 'string' ? value.trim() : ''
 }
 
 function checkoutApi(mode: string): Plugin {
@@ -122,15 +133,17 @@ function checkoutApi(mode: string): Plugin {
     'direct_card',
     'direct_card_extract.py',
   )
+  const subscriptionPath = join(appRoot, 'subscription_check.py')
+  const plusExtractorPath = join(appRoot, 'plus_checkout_extract.py')
   const pythonPath =
     environment.GPT_CHECKOUT_PYTHON ||
     join(toolRoot, '.venv', 'Scripts', 'python.exe')
   const defaultProxy =
     environment.GPT_CHECKOUT_PROXY || 'http://127.0.0.1:7890'
 
-  async function runExtractor(args: string[], proxyUrl: string) {
+  async function runExtractor(args: string[], proxyUrl: string, scriptPath = extractorPath, timeoutMs = 180_000) {
     return await new Promise<string>((resolveRun, rejectRun) => {
-      const child = spawn(pythonPath, [extractorPath, ...args], {
+      const child = spawn(pythonPath, [scriptPath, ...args], {
         cwd: toolRoot,
         env: {
           ...process.env,
@@ -146,8 +159,8 @@ function checkoutApi(mode: string): Plugin {
       const outputLimit = 1024 * 1024
       const timer = setTimeout(() => {
         child.kill()
-        rejectRun(new Error('创建支付链接超时，请检查代理节点后重试'))
-      }, 180_000)
+        rejectRun(new Error('请求超时，请检查代理节点后重试'))
+      }, timeoutMs)
 
       child.stdout.on('data', (chunk: Buffer) => {
         stdout += chunk.toString('utf8')
@@ -172,12 +185,14 @@ function checkoutApi(mode: string): Plugin {
           return
         }
         if (code !== 0) {
+          let upstreamError = ''
           try {
             const payload = JSON.parse(stdout) as { error?: string }
-            rejectRun(new Error(payload.error || '支付服务返回错误'))
+            upstreamError = payload.error || ''
           } catch {
-            rejectRun(new Error(stderr.trim().split('\n').at(-1) || '支付服务执行失败'))
+            // A non-JSON failure is reported from stderr below.
           }
+          rejectRun(new Error(upstreamError || stderr.trim().split('\n').at(-1) || '上游服务执行失败'))
           return
         }
         resolveRun(stdout)
@@ -191,7 +206,7 @@ function checkoutApi(mode: string): Plugin {
     next: () => void,
   ) {
     const pathname = new URL(request.url || '/', 'http://localhost').pathname
-    if (pathname !== '/api/health' && pathname !== '/api/create-checkout') {
+    if (pathname !== '/api/health' && pathname !== '/api/create-checkout' && pathname !== '/api/check-subscription') {
       next()
       return
     }
@@ -201,15 +216,17 @@ function checkoutApi(mode: string): Plugin {
     }
 
     if (pathname === '/api/health') {
-      const [pythonReady, extractorReady] = await Promise.all([
+      const [pythonReady, extractorReady, subscriptionScriptReady] = await Promise.all([
         exists(pythonPath),
         exists(extractorPath),
+        exists(subscriptionPath),
       ])
       const ok = pythonReady && extractorReady
       sendJson(response, ok ? 200 : 503, {
         ok,
         pythonReady,
         extractorReady,
+        subscriptionReady: pythonReady && subscriptionScriptReady,
         transport: 'curl_cffi chrome136',
         message: ok
           ? 'Chrome 指纹提取服务已就绪'
@@ -227,15 +244,37 @@ function checkoutApi(mode: string): Plugin {
     let temporaryDirectory = ''
     try {
       body = await readBody(request)
-      const accessToken = body.accessToken?.trim() || ''
-      const cookieValue = body.cookieHeader?.trim() || body.sessionToken?.trim() || ''
-      const country = body.country?.trim().toUpperCase() || ''
-      const currency = body.currency?.trim().toUpperCase() || ''
-      const planName = body.planName?.trim() || ''
-      const proxyUrl = validateProxy(body.proxyUrl?.trim() || defaultProxy)
+      const accessToken = bodyString(body.accessToken)
+      const cookieValue = bodyString(body.cookieHeader) || bodyString(body.sessionToken)
+      const country = bodyString(body.country).toUpperCase()
+      const currency = bodyString(body.currency).toUpperCase()
+      const planName = bodyString(body.planName)
+      const proxyUrl = validateProxy(bodyString(body.proxyUrl) || defaultProxy)
 
       if (!accessToken) throw new Error('Session 中缺少 access token')
       if (accessToken.length > 20_000) throw new Error('Access token 长度异常')
+      if (cookieValue.length > 20_000) throw new Error('Session Cookie 长度异常')
+      if (pathname === '/api/check-subscription') {
+        temporaryDirectory = await mkdtemp(join(tmpdir(), 'gpt-subscription-'))
+        const credentialPath = join(temporaryDirectory, 'session.json')
+        await writeFile(
+          credentialPath,
+          JSON.stringify({ accessToken, cookie_header: cookieValue || undefined }),
+          { encoding: 'utf8', mode: 0o600 },
+        )
+        const stdout = await runExtractor(
+          ['--credential-file', credentialPath],
+          proxyUrl,
+          subscriptionPath,
+          120_000,
+        )
+        const payload = JSON.parse(stdout) as { ok?: boolean; summary?: unknown; invoices?: unknown }
+        if (!payload.ok || !payload.summary || !Array.isArray(payload.invoices)) {
+          throw new Error('订阅接口没有返回有效结果')
+        }
+        sendJson(response, 200, payload)
+        return
+      }
       if (!countryCurrencies.has(country)) throw new Error('不支持所选账单国家')
       if (countryCurrencies.get(country) !== currency) {
         throw new Error('账单国家与币种不匹配')
@@ -260,14 +299,14 @@ function checkoutApi(mode: string): Plugin {
         '--checkout-proxy-country', country,
         '--update-proxy-country', country,
         '--plan-name', planName,
-        '--checkout-ui-mode', 'hosted',
+        '--checkout-ui-mode', planName === 'chatgptplusplan' ? 'custom' : 'hosted',
         '--checkout-attempts', '3',
         '--update-attempts', '2',
         '--full-attempts', '1',
         '--cf-same-identity-attempts', '2',
         '--cf-retry-delay', '1',
         '--timeout', '45',
-      ], proxyUrl)
+      ], proxyUrl, planName === 'chatgptplusplan' ? plusExtractorPath : extractorPath)
       const payload = JSON.parse(stdout) as {
         ok?: boolean
         long_url?: string
@@ -289,6 +328,7 @@ function checkoutApi(mode: string): Plugin {
           body.accessToken || '',
           body.cookieHeader || '',
           body.sessionToken || '',
+          body.proxyUrl || '',
         ]),
       })
     } finally {

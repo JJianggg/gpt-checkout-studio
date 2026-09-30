@@ -5,8 +5,8 @@
 ## 安全边界
 
 - Session 只从浏览器发送给本机 Vite 服务，不会写入浏览器持久化存储。
-- 凭证只写入权限受限的系统临时文件，提取器退出后立即删除。
-- 请求使用 `curl_cffi` 的 Chrome 136 指纹、Cookie Jar、设备 ID 与代理出口校验。
+- 凭证只写入权限受限的系统临时文件，请求结束后立即删除。
+- 请求使用 `curl_cffi` 的 Chrome 136 指纹、Cookie Jar 与设备 ID；创建结账链接时还会校验代理出口。
 - Access token、Cookie 和代理密码不会写入业务日志。
 - 只创建结账链接，不保存银行卡信息，也不会自动付款。
 - Vite 仅监听 127.0.0.1，API 同时校验本机 Host 与 Origin。
@@ -38,8 +38,12 @@ pnpm dev
 1. 在 Clash 中切换到目标国家节点，保持系统代理开启。
 2. 在输入框粘贴完整 session JSON 或单独的 access token，页面会自动提取。JSON 需要包含 `accessToken` 或 `access_token`。
 3. 选择与代理出口一致的国家；币种会自动匹配。
-4. 选择 Plus、Pro Lite 或 Pro，勾选授权确认后生成链接。
+4. 选择 Plus、Pro Lite、Pro 或 Pro Max，勾选授权确认后生成链接。
 5. 打开托管结账页，再次核对套餐、金额与币种后自行完成支付。
+
+页面左上角的“查询 GPT 实际订阅”会使用输入的 Session，经本机代理直接请求 ChatGPT 的账号、订阅和账单接口。结果显示当前套餐、有效期、续费状态和购买渠道。只有账单接口实际返回文件或收据链接时，才会显示对应下载入口。通过 Apple App Store 或 Google Play 购买的收据通常需要在对应商店的购买记录中获取。
+
+Plus 使用官网请求中的 `custom` 模式和网页结账来源字段；Pro Lite、Pro 和 Pro Max 使用 `hosted` 模式。两种模式的最终可用性均以 ChatGPT 返回的结账页为准。
 
 ## 完整链路
 
@@ -56,7 +60,7 @@ pnpm dev
 - `payment_proxy_pool_unavailable`：代理无法访问支付上游，或代理节点不适合该地区。
 - `401`：session 已失效，需要重新导出。
 - 提取服务异常：确认参考项目的 `.venv` 存在并已安装 `curl_cffi`，或设置正确的 `GPT_CHECKOUT_PYTHON`。
-- `unusual activity`：优先使用同一次登录导出的完整 Session/Cookie，并保持账号、账单国家和代理出口一致。
+- `unusual activity`：ChatGPT 支付接口拒绝创建结账；响应没有给出具体原因。如果官网可成功而本地失败，两边请求的浏览器上下文可能不同，请直接使用官网结账。请勿把官网请求中的动态校验令牌复制到本地配置中。
 - Cloudflare 403：确认代理节点可用，避免高频重试。
 
 本项目不会开启 0 元促销或 0 元金额校验；生成的是所选正常订阅档位的托管结账链接。

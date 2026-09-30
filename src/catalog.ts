@@ -48,4 +48,11 @@ export const PLANS: PlanOption[] = [
     priceHint: '20×',
     description: '高额度个人订阅档位',
   },
+  {
+    id: 'chatgptpromax',
+    name: 'ChatGPT Pro Max',
+    priceHint: '$500',
+    description: '最高使用额度，实际价格以结账页为准',
+    badge: '新',
+  },
 ]

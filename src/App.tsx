@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowRight,
   BadgeCheck,
@@ -9,6 +9,7 @@ import {
   Clipboard,
   ExternalLink,
   ClipboardPaste,
+  Download,
   Globe2,
   KeyRound,
   Link2,
@@ -25,6 +26,7 @@ import './App.css'
 
 type Health = {
   ok: boolean
+  subscriptionReady?: boolean
   pythonReady?: boolean
   extractorReady?: boolean
   transport?: string
@@ -40,6 +42,76 @@ type CheckoutResponse = {
 }
 
 type ViewStatus = 'idle' | 'ready' | 'loading' | 'success' | 'error'
+
+type SubscriptionSummary = {
+  email: string | null
+  account_id: string
+  plan_type: string | null
+  subscription_plan: string | null
+  has_active_subscription: boolean | null
+  will_renew: boolean | null
+  is_delinquent: boolean | null
+  expires_at: string | null
+  renews_at: string | null
+  cancels_at: string | null
+  grace_period_end: string | null
+  billing_period: string | null
+  billing_currency: string | null
+  purchase_origin_platform: string | null
+}
+
+type Invoice = {
+  id: string | null
+  number: string | null
+  date: string | null
+  status: string | null
+  invoice_url: string | null
+  invoice_downloadable: boolean
+  receipt_url: string | null
+}
+
+type SubscriptionResponse = {
+  ok?: boolean
+  summary?: SubscriptionSummary
+  invoices?: Invoice[]
+  subscription_error?: string | null
+  invoice_error?: string | null
+  error?: string
+}
+
+function formatDate(value: string | null) {
+  if (!value) return '未提供'
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('zh-CN', { hour12: false })
+}
+
+function planLabel(summary: SubscriptionSummary) {
+  if (summary.has_active_subscription === false) return '无有效付费订阅'
+  const value = `${summary.plan_type || ''} ${summary.subscription_plan || ''}`.toLowerCase()
+  if (value.includes('promax')) return 'Pro Max'
+  if (value.includes('prolite')) return 'Pro Lite'
+  if (value.includes('plus')) return 'Plus'
+  if (value.includes('pro')) return 'Pro'
+  if (value.includes('free')) return 'Free'
+  if (value.includes('team') || value.includes('business')) return 'Business'
+  return summary.plan_type || summary.subscription_plan || '未知套餐'
+}
+
+function platformLabel(value: string | null) {
+  if (!value) return '未提供'
+  if (value.includes('ios') || value.includes('app_store')) return 'Apple App Store'
+  if (value.includes('android') || value.includes('play_store')) return 'Google Play'
+  if (value.includes('web')) return 'ChatGPT 网页'
+  return value
+}
+
+function subscriptionVerdict(summary: SubscriptionSummary) {
+  if (summary.is_delinquent) return '付款异常'
+  if (summary.has_active_subscription === true && summary.will_renew === false) return '本期有效，已停止续费'
+  if (summary.has_active_subscription === true) return '订阅有效'
+  if (summary.has_active_subscription === false) return '当前无有效订阅'
+  return '订阅状态未知'
+}
 
 const progressSteps = ['验证会话', '匹配出口地区', '创建结账链接']
 
@@ -58,6 +130,11 @@ export default function App() {
   const [checkoutUrl, setCheckoutUrl] = useState('')
   const [copied, setCopied] = useState(false)
   const [health, setHealth] = useState<Health | null>(null)
+  const [subscriptionOpen, setSubscriptionOpen] = useState(false)
+  const [subscriptionStatus, setSubscriptionStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle')
+  const [subscriptionResult, setSubscriptionResult] = useState<SubscriptionResponse | null>(null)
+  const [subscriptionError, setSubscriptionError] = useState('')
+  const subscriptionRequest = useRef(0)
 
   const selectedCountry = useMemo(
     () => COUNTRIES.find((country) => country.code === countryCode) ?? COUNTRIES[0],
@@ -79,7 +156,20 @@ export default function App() {
       })
   }, [])
 
+  useEffect(() => {
+    if (!subscriptionOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSubscriptionOpen(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [subscriptionOpen])
+
   function acceptSessionText(value: string) {
+    subscriptionRequest.current += 1
+    setSubscriptionResult(null)
+    setSubscriptionStatus('idle')
+    setSubscriptionError('')
     setSessionInput(value)
     setMessage('')
     setCheckoutUrl('')
@@ -105,6 +195,10 @@ export default function App() {
   }
 
   function clearSession() {
+    subscriptionRequest.current += 1
+    setSubscriptionResult(null)
+    setSubscriptionStatus('idle')
+    setSubscriptionError('')
     setSessionInput('')
     setSession(null)
     setParseError('')
@@ -163,15 +257,62 @@ export default function App() {
     window.setTimeout(() => setCopied(false), 1600)
   }
 
+  async function checkSubscription() {
+    setSubscriptionOpen(true)
+    if (!session) {
+      setSubscriptionStatus('idle')
+      setSubscriptionError('请先在页面中粘贴 Session 或 access token。')
+      return
+    }
+    if (health?.subscriptionReady === false) {
+      setSubscriptionStatus('error')
+      setSubscriptionError('本地 Python 订阅查询服务未就绪，请检查 Python 环境。')
+      return
+    }
+    const requestId = ++subscriptionRequest.current
+    setSubscriptionStatus('loading')
+    setSubscriptionError('')
+    setSubscriptionResult(null)
+    try {
+      const response = await fetch('/api/check-subscription', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify({
+          accessToken: session.accessToken,
+          cookieHeader: session.cookieHeader,
+          sessionToken: session.sessionToken,
+          proxyUrl,
+        }),
+      })
+      const payload = (await response.json()) as SubscriptionResponse
+      if (!response.ok || !payload.ok || !payload.summary || !Array.isArray(payload.invoices)) {
+        throw new Error(payload.error || '订阅查询失败')
+      }
+      if (requestId !== subscriptionRequest.current) return
+      setSubscriptionResult(payload)
+      setSubscriptionStatus('success')
+    } catch (error) {
+      if (requestId !== subscriptionRequest.current) return
+      setSubscriptionStatus('error')
+      setSubscriptionError(error instanceof Error ? error.message : '订阅查询失败')
+    }
+  }
+
   const canCreate = Boolean(session && confirmed && health?.ok && status !== 'loading')
 
   return (
     <div className='app-shell'>
       <header className='topbar'>
-        <a className='brand' href='/' aria-label='Checkout Studio 首页'>
-          <span className='brand-mark'><Link2 size={19} strokeWidth={2.4} /></span>
-          <span>Checkout Studio</span>
-        </a>
+        <div className='topbar-left'>
+          <a className='brand' href='/' aria-label='Checkout Studio 首页'>
+            <span className='brand-mark'><Link2 size={19} strokeWidth={2.4} /></span>
+            <span>Checkout Studio</span>
+          </a>
+          <button className='subscription-trigger' type='button' onClick={() => void checkSubscription()}>
+            <BadgeCheck size={16} /> 查询 GPT 实际订阅
+          </button>
+        </div>
         <div className='topbar-right'>
           <span className='privacy-pill'><ShieldCheck size={15} /> Chrome 指纹传输，不保存凭证</span>
           <span className={health?.ok ? 'status-dot online' : 'status-dot'} />
@@ -180,6 +321,81 @@ export default function App() {
           </span>
         </div>
       </header>
+
+      {subscriptionOpen && (
+        <div className='subscription-overlay' onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setSubscriptionOpen(false)
+        }}>
+          <section className='subscription-dialog' role='dialog' aria-modal='true' aria-labelledby='subscription-title'>
+            <div className='subscription-dialog-head'>
+              <div>
+                <span className='subscription-kicker'>OPENAI · 实时查询</span>
+                <h2 id='subscription-title'>当前账号订阅详情</h2>
+              </div>
+              <button type='button' className='icon-button' onClick={() => setSubscriptionOpen(false)} aria-label='关闭订阅详情'><X size={19} /></button>
+            </div>
+
+            {subscriptionStatus === 'loading' && (
+              <div className='subscription-state'><LoaderCircle className='spin' size={26} /><span>正在向 ChatGPT 查询订阅和账单…</span></div>
+            )}
+            {subscriptionError && subscriptionStatus !== 'loading' && (
+              <div className='subscription-error'><CircleAlert size={18} /> {subscriptionError}</div>
+            )}
+            {subscriptionResult?.summary && subscriptionStatus === 'success' && (
+              <>
+                <div className='subscription-verdict'>
+                  <span>查询结果</span>
+                  <strong>{subscriptionVerdict(subscriptionResult.summary)}</strong>
+                </div>
+                {subscriptionResult.subscription_error && (
+                  <p className='invoice-note subscription-partial'>订阅接口暂不可用（{subscriptionResult.subscription_error}），以下为 ChatGPT 账号接口返回的订阅信息。</p>
+                )}
+                <div className='subscription-details'>
+                  <div><span>账号邮箱</span><strong>{subscriptionResult.summary.email || '未提供'}</strong></div>
+                  <div><span>当前套餐</span><strong>{planLabel(subscriptionResult.summary)}</strong></div>
+                  <div><span>{subscriptionResult.summary.has_active_subscription === false ? '最近订阅标识' : 'OpenAI 套餐标识'}</span><strong>{subscriptionResult.summary.subscription_plan || '未提供'}</strong></div>
+                  <div><span>{subscriptionResult.summary.has_active_subscription === false ? '最近订阅到期时间' : '本期有效至'}</span><strong>{formatDate(subscriptionResult.summary.expires_at)}</strong></div>
+                  <div><span>续费状态</span><strong>{subscriptionResult.summary.will_renew === null ? '未提供' : subscriptionResult.summary.will_renew ? '预计续费' : '不会续费'}</strong></div>
+                  {subscriptionResult.summary.renews_at && <div><span>预计续费时间</span><strong>{formatDate(subscriptionResult.summary.renews_at)}</strong></div>}
+                  {subscriptionResult.summary.cancels_at && <div><span>取消时间</span><strong>{formatDate(subscriptionResult.summary.cancels_at)}</strong></div>}
+                  {subscriptionResult.summary.grace_period_end && <div><span>宽限期至</span><strong>{formatDate(subscriptionResult.summary.grace_period_end)}</strong></div>}
+                  <div><span>购买渠道</span><strong>{platformLabel(subscriptionResult.summary.purchase_origin_platform)}</strong></div>
+                  {subscriptionResult.summary.billing_period && <div><span>账单周期</span><strong>{subscriptionResult.summary.billing_period}</strong></div>}
+                  {subscriptionResult.summary.billing_currency && <div><span>账单币种</span><strong>{subscriptionResult.summary.billing_currency}</strong></div>}
+                  <div><span>账号 ID</span><strong className='account-id'>{subscriptionResult.summary.account_id}</strong></div>
+                </div>
+
+                <div className='invoice-heading'><h3>账单与收据</h3><span>{subscriptionResult.invoices?.length || 0} 条记录</span></div>
+                {subscriptionResult.invoice_error ? (
+                  <p className='invoice-note'>账单接口暂不可用（{subscriptionResult.invoice_error}）。可到 ChatGPT 账户设置中的付款管理页查看。</p>
+                ) : subscriptionResult.invoices?.length ? (
+                  <div className='invoice-list'>
+                    {subscriptionResult.invoices.map((invoice, index) => (
+                      <div className='invoice-row' key={invoice.id || `${invoice.number || 'invoice'}-${index}`}>
+                        <div className='invoice-meta'>
+                          <strong>{invoice.number || invoice.id || `账单 ${index + 1}`}</strong>
+                          <span>{formatDate(invoice.date)}{invoice.status ? ` · ${invoice.status}` : ''}</span>
+                        </div>
+                        <div className='invoice-actions'>
+                          {invoice.invoice_url && <a href={invoice.invoice_url} target='_blank' rel='noopener noreferrer'><Download size={14} /> {invoice.invoice_downloadable ? '下载账单' : '查看账单'}</a>}
+                          {invoice.receipt_url && <a href={invoice.receipt_url} target='_blank' rel='noopener noreferrer'><Download size={14} /> 下载收据</a>}
+                          {!invoice.invoice_url && !invoice.receipt_url && <span>未提供下载链接</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className='invoice-note'>当前账号没有返回账单或收据记录。App Store 和 Google Play 购买的收据请在对应商店的购买记录中查看。</p>
+                )}
+              </>
+            )}
+            <div className='subscription-dialog-foot'>
+              <span>数据来自当前 Session 的 ChatGPT 接口</span>
+              <button type='button' onClick={() => void checkSubscription()} disabled={!session || subscriptionStatus === 'loading'}><RefreshCw size={15} /> 重新查询</button>
+            </div>
+          </section>
+        </div>
+      )}
 
       <main>
         <section className='hero'>
@@ -446,7 +662,7 @@ export default function App() {
 
       <footer>
         <span>Checkout Studio · Local-first utility</span>
-        <span>凭证只交给本机 curl_cffi 提取器，调用后立即清理</span>
+        <span>凭证只交给本机 curl_cffi 请求进程，调用后立即清理</span>
       </footer>
     </div>
   )
